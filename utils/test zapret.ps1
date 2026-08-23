@@ -16,6 +16,17 @@ function Get-IpsetStatus {
     if ($hasDummy) { return "none" } else { return "loaded" }
 }
 
+function Wait-WinwsReady {
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    while ($timer.ElapsedMilliseconds -lt 5000) {
+        if (Get-Process -Name "winws" -ErrorAction SilentlyContinue) {
+            Start-Sleep -Milliseconds 400
+            return
+        }
+        Start-Sleep -Milliseconds 80
+    }
+}
+
 function Set-IpsetMode {
     param([string]$mode)
     $listFile = Join-Path $listsDir "ipset-all.txt"
@@ -83,6 +94,10 @@ $dpiCustomHost = $env:MONITOR_HOST
 if ($env:MONITOR_TIMEOUT) { [int]$dpiTimeoutSeconds = $env:MONITOR_TIMEOUT }
 if ($env:MONITOR_RANGE) { [int]$dpiRangeBytes = $env:MONITOR_RANGE }
 if ($env:MONITOR_MAX_PARALLEL) { [int]$dpiMaxParallel = $env:MONITOR_MAX_PARALLEL }
+$standardCurlTimeout = 4
+$standardMaxParallel = 8
+if ($env:TEST_CURL_TIMEOUT) { [int]$standardCurlTimeout = $env:TEST_CURL_TIMEOUT }
+if ($env:TEST_MAX_PARALLEL) { [int]$standardMaxParallel = $env:TEST_MAX_PARALLEL }
 
 function Get-DpiSuite {
     # Suite sourced from https://github.com/hyperion-cs/dpi-checkers (Apache-2.0 license)
@@ -161,6 +176,7 @@ function Invoke-DpiSuite {
             $curlArgs = @(
                 "--range", $rangeSpec,
                 "-m", $TimeoutSeconds,
+                "--connect-timeout", ([Math]::Min(3, $TimeoutSeconds)),
                 "-w", "%{http_code} %{size_upload} %{size_download} %{time_total}",
                 "-o", "NUL",
                 "-X", "POST",
@@ -168,7 +184,7 @@ function Invoke-DpiSuite {
                 "-s"
             ) + $test.Args + @("https://$($target.Host)")
 
-            $output = $payload | curl.exe @curlArgs 2>&1
+            $output = & curl.exe @curlArgs 2>&1
             $exit = $LASTEXITCODE
             $text = ($output | Out-String).Trim()
 
@@ -251,7 +267,7 @@ function Invoke-DpiSuite {
     foreach ($rs in $runspaces) {
         # Wait for the runspace to complete with a small grace period beyond curl's timeout
         try {
-            $waitMs = ([int]$TimeoutSeconds + 5) * 1000
+            $waitMs = (([int]$TimeoutSeconds * 3) + 5) * 1000
             $handle = $rs.Handle
             if ($handle -and $handle.AsyncWaitHandle) {
                 $completed = $handle.AsyncWaitHandle.WaitOne($waitMs)
@@ -299,6 +315,7 @@ function Invoke-DpiSuite {
     }
     $runspacePool.Close()
     $runspacePool.Dispose()
+    Remove-Item -LiteralPath $payloadFile -Force -ErrorAction SilentlyContinue
 
     if ($warnDetected) {
         Write-Host ""
@@ -368,7 +385,7 @@ if ($hasErrors) {
     exit 1
 }
 
-$dpiTargets = Build-DpiTargets -CustomHost $dpiCustomHost
+$dpiTargets = @()
 
 # Config
 $targetDir = $rootDir
@@ -491,6 +508,10 @@ $mode = Read-ModeSelection
 if ($mode -eq 'select') {
     $selected = Read-ConfigSelection -allFiles $batFiles
     $batFiles = @($selected)
+}
+
+if ($testType -eq 'dpi') {
+    $dpiTargets = Build-DpiTargets -CustomHost $dpiCustomHost
 }
 
 # Load targets once for standard mode
@@ -629,13 +650,13 @@ try {
     $proc = Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"$($file.FullName)`"" -WorkingDirectory $targetDir -PassThru -WindowStyle Minimized
     
     # Wait init
-    Start-Sleep -Seconds 5
+    Wait-WinwsReady
     
     if ($testType -eq 'standard') {
-        $curlTimeoutSeconds = 5
+        $curlTimeoutSeconds = $standardCurlTimeout
 
         # Parallel target checks via runspace pool (faster than jobs)
-        $maxParallel = 8
+        $maxParallel = $standardMaxParallel
         $runspacePool = [runspacefactory]::CreateRunspacePool(1, $maxParallel)
         $runspacePool.Open()
 
@@ -651,7 +672,7 @@ try {
                     @{ Label = "TLS1.3"; Args = @("--tlsv1.3", "--tls-max", "1.3") }
                 )
 
-                $baseArgs = @("-I", "-s", "-m", $curlTimeoutSeconds, "-o", "NUL", "-w", "%{http_code}", "--show-error")
+                $baseArgs = @("-I", "-s", "-m", $curlTimeoutSeconds, "--connect-timeout", ([Math]::Min(2, $curlTimeoutSeconds)), "-o", "NUL", "-w", "%{http_code}", "--show-error")
                 foreach ($test in $tests) {
                     try {
                         $curlArgs = $baseArgs + $test.Args
@@ -692,7 +713,7 @@ try {
             $pingResult = "n/a"
             if ($t.PingTarget) {
                 try {
-                    $pings = Test-Connection -ComputerName $t.PingTarget -Count 3 -ErrorAction Stop
+                    $pings = Test-Connection -ComputerName $t.PingTarget -Count 1 -ErrorAction Stop
                     $avg = ($pings | Measure-Object -Property ResponseTime -Average).Average
                     $pingResult = "{0:N0} ms" -f $avg
                 } catch {
@@ -727,7 +748,7 @@ try {
         $targetResults = @()
         foreach ($rs in $runspaces) {
             try {
-                $waitMs = ([int]$curlTimeoutSeconds + 5) * 1000
+                $waitMs = (([int]$curlTimeoutSeconds * 3) + 5) * 1000
                 $handle = $rs.Handle
                 if ($handle -and $handle.AsyncWaitHandle) {
                     $completed = $handle.AsyncWaitHandle.WaitOne($waitMs)
