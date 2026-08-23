@@ -10,20 +10,20 @@ if (-not (Test-Path $resultsDir)) { New-Item -ItemType Directory -Path $resultsD
 function Get-IpsetStatus {
     $listFile = Join-Path $listsDir "ipset-all.txt"
     if (-not (Test-Path $listFile)) { return "none" }
-    $lineCount = (Get-Content $listFile | Measure-Object -Line).Lines
-    if ($lineCount -eq 0) { return "any" }
-    $hasDummy = Get-Content $listFile | Select-String -Pattern "203\.0\.113\.113/32" -Quiet
-    if ($hasDummy) { return "none" } else { return "loaded" }
+    $raw = [IO.File]::ReadAllText($listFile)
+    if ([string]::IsNullOrWhiteSpace($raw)) { return "any" }
+    if ($raw -match '203\.0\.113\.113/32') { return "none" }
+    return "loaded"
 }
 
 function Wait-WinwsReady {
     $timer = [Diagnostics.Stopwatch]::StartNew()
     while ($timer.ElapsedMilliseconds -lt 5000) {
         if (Get-Process -Name "winws" -ErrorAction SilentlyContinue) {
-            Start-Sleep -Milliseconds 400
+            Start-Sleep -Milliseconds 300
             return
         }
-        Start-Sleep -Milliseconds 80
+        Start-Sleep -Milliseconds 200
     }
 }
 
@@ -89,13 +89,14 @@ function Convert-Target {
 # DPI checker defaults (override via MONITOR_* env vars like in monitor.ps1)
 $dpiTimeoutSeconds = 5
 $dpiRangeBytes = 65536
-$dpiMaxParallel = 8
+$defaultMaxParallel = [Math]::Min(16, [Math]::Max(8, [Environment]::ProcessorCount * 2))
+$dpiMaxParallel = $defaultMaxParallel
 $dpiCustomHost = $env:MONITOR_HOST
 if ($env:MONITOR_TIMEOUT) { [int]$dpiTimeoutSeconds = $env:MONITOR_TIMEOUT }
 if ($env:MONITOR_RANGE) { [int]$dpiRangeBytes = $env:MONITOR_RANGE }
 if ($env:MONITOR_MAX_PARALLEL) { [int]$dpiMaxParallel = $env:MONITOR_MAX_PARALLEL }
 $standardCurlTimeout = 4
-$standardMaxParallel = 8
+$standardMaxParallel = $defaultMaxParallel
 if ($env:TEST_CURL_TIMEOUT) { [int]$standardCurlTimeout = $env:TEST_CURL_TIMEOUT }
 if ($env:TEST_MAX_PARALLEL) { [int]$standardMaxParallel = $env:TEST_MAX_PARALLEL }
 
@@ -712,12 +713,19 @@ try {
 
             $pingResult = "n/a"
             if ($t.PingTarget) {
+                $ping = $null
                 try {
-                    $pings = Test-Connection -ComputerName $t.PingTarget -Count 1 -ErrorAction Stop
-                    $avg = ($pings | Measure-Object -Property ResponseTime -Average).Average
-                    $pingResult = "{0:N0} ms" -f $avg
+                    $ping = New-Object System.Net.NetworkInformation.Ping
+                    $reply = $ping.Send($t.PingTarget, 1000)
+                    if ($reply.Status -eq [System.Net.NetworkInformation.IPStatus]::Success) {
+                        $pingResult = "{0:N0} ms" -f $reply.RoundtripTime
+                    } else {
+                        $pingResult = "Timeout"
+                    }
                 } catch {
                     $pingResult = "Timeout"
+                } finally {
+                    if ($ping) { $ping.Dispose() }
                 }
             }
 
@@ -902,19 +910,18 @@ try {
     # Save to file
     $dateStr = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
     $resultFile = Join-Path $resultsDir "test_results_$dateStr.txt"
-    # Clear file
-    "" | Out-File $resultFile -Encoding UTF8
+    $resultLines = New-Object System.Collections.Generic.List[string]
     foreach ($res in $globalResults) {
         $config = $res.Config
         $type = $res.Type
         $results = $res.Results
-        Add-Content $resultFile "Config: $config (Type: $type)"
+        [void]$resultLines.Add("Config: $config (Type: $type)")
         if ($type -eq 'standard') {
             foreach ($targetRes in $results) {
                 $name = $targetRes.Name
                 $http = $targetRes.HttpTokens -join ' '
                 $ping = $targetRes.PingResult
-                Add-Content $resultFile "  $name : $http | Ping: $ping"
+                [void]$resultLines.Add("  $name : $http | Ping: $ping")
             }
         } elseif ($type -eq 'dpi') {
             foreach ($targetRes in $results) {
@@ -922,9 +929,9 @@ try {
                 $provider = $targetRes.Provider
                 $country = $targetRes.Country
                 if ($country) {
-                    Add-Content $resultFile "  Target: [$country] $id ($provider)"
+                    [void]$resultLines.Add("  Target: [$country] $id ($provider)")
                 } else {
-                    Add-Content $resultFile "  Target: $id ($provider)"
+                    [void]$resultLines.Add("  Target: $id ($provider)")
                 }
                 foreach ($line in $targetRes.Lines) {
                     $test = $line.TestLabel
@@ -933,15 +940,15 @@ try {
                     $down = $line.DownKB
                     $time = $line.Time
                     $status = $line.Status
-                    Add-Content $resultFile "    ${test}: code=${code}  up=${up} KB  down=${down} KB  time=${time}s  status=${status}"
+                    [void]$resultLines.Add("    ${test}: code=${code}  up=${up} KB  down=${down} KB  time=${time}s  status=${status}")
                 }
             }
         }
-        Add-Content $resultFile ""
+        [void]$resultLines.Add("")
     }
 
     # Add analytics
-    Add-Content $resultFile "=== ANALYTICS ==="
+    [void]$resultLines.Add("=== ANALYTICS ===")
     $maxConfigLen = ($analytics.Keys | ForEach-Object { $_.Length } | Measure-Object -Maximum).Maximum
     foreach ($config in $analytics.Keys) {
         $a = $analytics[$config]
@@ -953,10 +960,11 @@ try {
             $line = "{0} : OK: {1,3}, FAIL: {2,3}, UNSUP: {3,3}, BLOCKED: {4,3}" -f `
                 $configPadded, $a.OK, $a.FAIL, $a.UNSUPPORTED, $a.LIKELY_BLOCKED
         }
-        Add-Content $resultFile $line
+        [void]$resultLines.Add($line)
     }
 
-    Add-Content $resultFile "Best strategy: $bestConfig"
+    [void]$resultLines.Add("Best strategy: $bestConfig")
+    $resultLines | Set-Content $resultFile -Encoding UTF8
 
     Write-Host "Results saved to $resultFile" -ForegroundColor Green
 
